@@ -9,36 +9,21 @@
    [boot.core          :refer :all]
    [boot.from.backtick :refer [template]]))
 
-(def ^:private deps '[[http-kit "2.1.18"]])
+(def ^:private deps '[[figwheel-sidecar "0.2.0-SNAPSHOT"]
+                      [figwheel "0.2.0-SNAPSHOT"]])
 
 (defn- make-pod []
   (future (-> (get-env) (update-in [:dependencies] into deps) pod/make-pod)))
 
-(defn- changed [before after]
-  (when before
-    (->> (fileset-diff before after) output-files (map tmppath) set)))
-
-(defn- start-server [pod {:keys [ip port] :as opts}]
-  (let [{:keys [ip port]}
-        (pod/with-call-in pod (adzerk.boot-reload.server/start ~opts))
-        host (if-not (= ip "0.0.0.0") ip "localhost")]
-    (with-let [url (format "ws://%s:%d" host port)]
-      (info "<< started reload server on %s >>\n" url))))
-
-(defn- write-cljs! [f url on-jsload]
+(defn- write-cljs! [f on-jsload]
   (->> (template
          ((ns adzerk.boot-reload
             (:require
-             [adzerk.boot-reload.client :as client]
+             [figwheel.client :as client]
              ~@(when on-jsload [(symbol (namespace on-jsload))])))
-          (when-not (client/alive?)
-            (client/connect ~url
-              {:on-jsload #(~(or on-jsload '+))}))))
+          (client/start
+            {:on-jsload #(~(or on-jsload '+))})))
     (map pr-str) (interpose "\n") (apply str) (spit f)))
-
-(defn- send-changed! [pod changed]
-  (pod/with-call-in pod
-    (adzerk.boot-reload.server/send-changed! ~(get-env :target-path) ~changed)))
 
 (deftask reload
   "Live reload of page resources in browser via websocket.
@@ -54,11 +39,22 @@
         tmp  (temp-dir!)
         prev (atom nil)
         out  (doto (io/file tmp "adzerk" "boot_reload.cljs") io/make-parents)]
-    (write-cljs! out (start-server @pod {:ip ip :port port}) on-jsload)
+    (write-cljs! out on-jsload)
     (comp
-     (with-pre-wrap fileset
+     (with-pre-wrap
+       fileset
+       (pod/with-call-in @pod
+         (adzerk.boot-reload.impl/start! {}))
        (-> fileset (add-resource tmp) commit!))
-     (with-post-wrap fileset
-       (send-changed! @pod (changed @prev fileset))
+     (with-post-wrap
+       fileset
+       (let [changes (->> fileset
+                          (fileset-diff @prev)
+                          output-files)
+             css-changes   (by-ext [".css"] changes)
+             changed-files (not-by-ext [".css"] changes)]
+         (pod/with-call-in @pod
+           (do
+             (adzerk.boot-reload.impl/send-css-files! ~@(map tmppath css-changes))
+             (adzerk.boot-reload.impl/send-files-changed! ~@(map tmppath changed-files)))))
        (reset! prev fileset)))))
-
